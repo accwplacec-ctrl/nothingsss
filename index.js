@@ -1,178 +1,155 @@
-'use strict'
-
-require('dotenv').config()
-
-const readline = require('readline')
 const mineflayer = require('mineflayer')
-const { pathfinder, Movements } = require('mineflayer-pathfinder')
-const collectBlockPlugin = require('mineflayer-collectblock').plugin
-const toolPlugin = require('mineflayer-tool').plugin
-const { WebSocketServer } = require('ws')
-const { bin: cloudflaredBin } = require('cloudflared')
-const { spawn } = require('child_process')
+const readline = require('readline')
+const { exec } = require('child_process')
+const pathfinderPkg = require('mineflayer-pathfinder')
+const { Movements, goals } = pathfinderPkg
 
-const { executeAction, clearFollowTasks } = require('./actionHandler')
+const HOST = 'rune.pikamc.vn'
+const PORT = 25078
+const USERNAME = 'lamthanh'
+const PASSWORD = 'matkhau123'
+const VERSION = '1.20.1'
 
-// ===== Cau hinh (doc tu .env) =====
-const CONFIG = {
-  host: process.env.MC_HOST || 'localhost',
-  port: parseInt(process.env.MC_PORT || '25565', 10),
-  username: process.env.MC_USERNAME || 'AiBot',
-  // MC_VERSION la bien moi truong nen luon la chuoi. Neu de trong hoac ghi "false"
-  // (khong phan biet hoa/thuong) thi coi la false that (mineflayer se tu do version).
-  version: (() => {
-    const v = (process.env.MC_VERSION || '').trim()
-    if (!v || v.toLowerCase() === 'false') return false
-    return v
-  })(),
-  auth: process.env.MC_AUTH || 'offline',
-  owner: process.env.OWNER_NAME || '',
-  wsPort: parseInt(process.env.WS_PORT || '8765', 10),
-  afkMinSec: parseInt(process.env.AFK_MIN_INTERVAL_SEC || '45', 10),
-  afkMaxSec: parseInt(process.env.AFK_MAX_INTERVAL_SEC || '100', 10),
-  // De trong USE_TUNNEL=false neu Wispbyte da cho public WS_PORT san (khong can cloudflared)
-  useTunnel: (process.env.USE_TUNNEL || 'true').toLowerCase() !== 'false',
-}
-
-if (!CONFIG.owner) {
-  console.log('⚠️ CẢNH BÁO: Chưa cấu hình OWNER_NAME trong .env — bot sẽ không nhận lệnh từ ai trong game.')
-}
-
+const scriptStartTime = Date.now()
 let bot = null
-let wss = null
+let connectedSince = null
+let registered = false
+let loggedIn = false
+
 let reconnectAttempts = 0
-let afkTimeout = null
-let statusInterval = null
+let totalReconnects = 0
+let reconnecting = false
 let shuttingDown = false
-let tunnelProcess = null
+let reconnectTimeoutId = null
+let nextReconnectAt = null
 
-// ===== WebSocket server: cau noi voi Colab =====
+let afkTimeout = null
+let reportInterval = null
+let autoShutdownTimeout = null
+let idleHeartbeat = null
 
-async function startWebSocketServer() {
-  wss = new WebSocketServer({ port: CONFIG.wsPort })
-  console.log(`🌐 WebSocket server đang lắng nghe tại cổng ${CONFIG.wsPort} (nội bộ container).`)
-
-  wss.on('connection', (ws) => {
-    console.log('🔗 Colab đã kết nối qua WebSocket.')
-
-    ws.on('message', async (raw) => {
-      let msg
-      try {
-        msg = JSON.parse(raw.toString())
-      } catch (e) {
-        console.log('❌ Nhận được JSON không hợp lệ từ Colab:', e.message)
-        return
-      }
-
-      if (!bot) {
-        console.log('⚠️ Nhận action nhưng bot chưa kết nối vào server Minecraft.')
-        return
-      }
-
-      await executeAction(bot, msg, CONFIG.owner)
-    })
-
-    ws.on('close', () => console.log('🔌 Colab đã ngắt kết nối WebSocket.'))
-    ws.on('error', (err) => console.log('❌ Lỗi WebSocket:', err.message))
+// ===== Wake-lock Termux =====
+function acquireWakeLock() {
+  exec('termux-wake-lock', (err) => {
+    if (err) console.log('⚠️ Không gọi được termux-wake-lock — cần pkg install termux-api + app Termux:API.')
+    else console.log('🔒 Đã giữ wake-lock.')
   })
+}
+function releaseWakeLock() {
+  exec('termux-wake-unlock', () => {})
+}
 
-  // ---- Public hoa cong WS_PORT qua cloudflared quick tunnel ----
-  // Khong can dang ky/authtoken, khong gioi han 1-session-nhu-ngrok-free.
-  if (CONFIG.useTunnel) {
-    startCloudflaredTunnel()
-  } else {
-    console.log('ℹ️ USE_TUNNEL=false — giả định WS_PORT đã được public sẵn qua allocation của host.')
+// ===== Tiện ích =====
+function formatDuration(ms) {
+  const min = Math.floor(ms / 60000)
+  const h = Math.floor(min / 60)
+  const m = min % 60
+  return h > 0 ? `${h}h${m}m` : `${m}m`
+}
+function memUsageMB() {
+  return (process.memoryUsage().rss / 1024 / 1024).toFixed(1)
+}
+
+// ===== Dọn bot cũ hoàn toàn =====
+function destroyBot() {
+  if (bot) {
+    try { bot.removeAllListeners() } catch (e) {}
+    try { bot.end() }               catch (e) {}
+    bot = null
   }
 }
 
-function startCloudflaredTunnel() {
-  console.log('🚇 Đang mở cloudflared quick tunnel...')
-
-  tunnelProcess = spawn(cloudflaredBin, ['tunnel', '--url', `http://localhost:${CONFIG.wsPort}`])
-
-  let urlPrinted = false
-  const urlRegex = /https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/
-
-  const handleOutput = (data) => {
-    const text = data.toString()
-
-    if (!urlPrinted) {
-      const match = text.match(urlRegex)
-      if (match) {
-        const wsUrl = match[0].replace(/^https:\/\//, 'wss://')
-        console.log('='.repeat(60))
-        console.log(`🌍 URL PUBLIC CHO COLAB (MINEFLAYER_WS_URL): ${wsUrl}`)
-        console.log('='.repeat(60))
-        urlPrinted = true
-      }
-    }
-  }
-
-  // cloudflared in URL ra stderr, khong phai stdout
-  tunnelProcess.stdout.on('data', handleOutput)
-  tunnelProcess.stderr.on('data', handleOutput)
-
-  tunnelProcess.on('error', (err) => {
-    console.log('❌ Không khởi động được cloudflared:', err.message)
-    console.log('   -> Nếu Wispbyte đã cấp sẵn 1 port public khác cho WS_PORT, đặt USE_TUNNEL=false trong .env và dùng thẳng IP:port đó.')
-  })
-
-  tunnelProcess.on('exit', (code, signal) => {
-    if (shuttingDown) return
-    console.log(`⚠️ cloudflared tunnel đã thoát (code=${code}, signal=${signal}). Đang mở lại sau 5s...`)
-    tunnelProcess = null
-    setTimeout(startCloudflaredTunnel, 5000)
-  })
+// ===== Tự nghỉ theo giờ VN =====
+function msUntilNextVNHour(targetHour) {
+  const vnOffsetMs = 7 * 60 * 60 * 1000
+  const now = new Date()
+  const nowVN = new Date(now.getTime() + vnOffsetMs)
+  const target = new Date(Date.UTC(
+    nowVN.getUTCFullYear(), nowVN.getUTCMonth(), nowVN.getUTCDate(),
+    targetHour, 0, 0
+  ))
+  if (nowVN.getTime() >= target.getTime()) target.setUTCDate(target.getUTCDate() + 1)
+  return target.getTime() - nowVN.getTime()
 }
 
-// Gui du lieu (chat cua chu, trang thai bot...) toi tat ca client dang ket noi (Colab)
-function broadcastToColab(payload) {
-  if (!wss) return
-  const data = JSON.stringify(payload)
-  wss.clients.forEach((client) => {
-    if (client.readyState === 1 /* OPEN */) {
-      try {
-        client.send(data)
-      } catch (e) {
-        console.log('❌ Lỗi gửi dữ liệu tới Colab:', e.message)
-      }
-    }
-  })
+function scheduleAutoShutdown(targetHour = 5) {
+  if (autoShutdownTimeout) clearTimeout(autoShutdownTimeout)
+  const delay = msUntilNextVNHour(targetHour)
+  console.log(`🕐 Bot sẽ tự nghỉ sau ${(delay / 3600000).toFixed(2)} giờ (lúc ${targetHour}:00 VN)`)
+  autoShutdownTimeout = setTimeout(() => goIdle(`Đã đến ${targetHour}:00 sáng VN`), delay)
 }
 
-// ===== Console chat: go truc tiep vao console cua host de bot noi chuyen trong game =====
-// Vi du: go "say hi" roi Enter -> bot.chat("say hi") trong Minecraft.
-// Cac panel dang Pterodactyl (Wispbyte) thuong forward text go vao console thang toi stdin
-// cua tien trinh Node, nen chi can lang nghe process.stdin la du, khong can lenh dac biet gi them.
-function startConsoleChat() {
-  const rl = readline.createInterface({ input: process.stdin, terminal: false })
-  console.log('⌨️  Console chat đã bật — gõ bất kỳ dòng nào rồi Enter để bot nói trong chat game.')
+// ===== Idle / Wake =====
+function goIdle(reason) {
+  shuttingDown = true
+  connectedSince = null
+  registered = false
+  loggedIn = false
+  console.log(`🌙 ${reason} → Ngắt kết nối, chuyển sang chế độ nghỉ.`)
+  console.log('💤 Gõ "wake" để bật lại.')
 
-  rl.on('line', (line) => {
-    const text = line.trim()
-    if (!text) return
+  if (afkTimeout)          clearTimeout(afkTimeout)
+  if (reportInterval)      clearInterval(reportInterval)
+  if (autoShutdownTimeout) clearTimeout(autoShutdownTimeout)
+  if (reconnectTimeoutId)  clearTimeout(reconnectTimeoutId)
+  nextReconnectAt = null
 
-    if (!bot) {
-      console.log('⚠️ Bot chưa kết nối vào server Minecraft, không gửi được.')
-      return
-    }
+  destroyBot()
+  releaseWakeLock()
 
-    try {
-      bot.chat(text)
-      console.log(`💬 (console) -> ${text}`)
-    } catch (e) {
-      console.log('❌ Lỗi gửi chat từ console:', e.message)
-    }
-  })
+  if (idleHeartbeat) clearInterval(idleHeartbeat)
+  idleHeartbeat = setInterval(() => {
+    console.log(`💤 [${new Date().toLocaleTimeString()}] Đang nghỉ — gõ "wake" để bật lại.`)
+  }, 1800000)
 }
 
-// ===== Anti-AFK: hanh vi ngau nhien don gian de tranh bi kick do AFK =====
+function wake() {
+  if (!shuttingDown) { console.log('ℹ️ Bot đang hoạt động, không cần wake.'); return }
+  console.log('🌞 Đang bật lại bot...')
+  shuttingDown = false
+  reconnectAttempts = 0
+  if (idleHeartbeat) clearInterval(idleHeartbeat)
+  acquireWakeLock()
+  scheduleAutoShutdown(5)
+  connect()
+}
 
+function forceReconnect() {
+  if (shuttingDown) { console.log('⚠️ Bot đang nghỉ. Gõ "wake" trước.'); return }
+  console.log('🔄 Buộc kết nối lại ngay...')
+  if (reconnectTimeoutId) { clearTimeout(reconnectTimeoutId); reconnectTimeoutId = null }
+  nextReconnectAt = null
+  reconnecting = true
+  destroyBot()
+  reconnectAttempts = 0
+  setTimeout(() => { reconnecting = false; connect() }, 1000)
+}
+
+// ===== Reconnect =====
+function scheduleReconnect() {
+  if (reconnecting || shuttingDown) return
+  reconnecting = true
+  if (afkTimeout)     clearTimeout(afkTimeout)
+  if (reportInterval) clearInterval(reportInterval)
+
+  const delay = Math.min(10000 * Math.pow(1.5, reconnectAttempts), 300000)
+  reconnectAttempts++
+  totalReconnects++
+  nextReconnectAt = Date.now() + delay
+  console.log(`⏳ Chờ ${Math.round(delay / 1000)}s rồi kết nối lại (lần ${reconnectAttempts})...`)
+
+  reconnectTimeoutId = setTimeout(() => {
+    nextReconnectAt = null
+    reconnecting = false
+    reconnectTimeoutId = null
+    connect()
+  }, delay)
+}
+
+// ===== Anti-AFK =====
 function scheduleAfk() {
   if (afkTimeout) clearTimeout(afkTimeout)
-  const min = CONFIG.afkMinSec * 1000
-  const max = CONFIG.afkMaxSec * 1000
-  const delay = min + Math.random() * Math.max(0, max - min)
+  const delay = 45000 + Math.random() * 55000
   afkTimeout = setTimeout(() => {
     doAfkAction()
     scheduleAfk()
@@ -180,124 +157,315 @@ function scheduleAfk() {
 }
 
 function doAfkAction() {
-  if (!bot) return
-  try {
-    const yaw = Math.random() * Math.PI * 2
-    const pitch = (Math.random() * 40 - 20) * (Math.PI / 180)
-    bot.look(yaw, pitch, false)
+  if (!bot || !loggedIn) return
+  const yaw   = Math.random() * Math.PI * 2
+  const pitch = (Math.random() * 40 - 20) * (Math.PI / 180)
+  try { bot.look(yaw, pitch, false) } catch (e) {}
 
-    if (Math.random() < 0.3) {
+  if (Math.random() < 0.3) {
+    try {
       bot.setControlState('jump', true)
-      setTimeout(() => {
-        try { bot.setControlState('jump', false) } catch (e) {}
-      }, 300)
-    }
+      setTimeout(() => { try { bot.setControlState('jump', false) } catch(e){} }, 300)
+    } catch (e) {}
+  }
+
+  try {
+    bot.setControlState('forward', true)
+    setTimeout(() => { try { bot.setControlState('forward', false) } catch(e){} }, 200 + Math.random() * 200)
+  } catch (e) {}
+}
+
+// ===== Di chuyển & Đào (dùng pathfinder) =====
+async function gotoCoords(x, y, z) {
+  if (!bot) return console.log('⚠️ Bot chưa kết nối.')
+  console.log(`🚶 Đang di chuyển tới ${x}, ${y}, ${z}...`)
+  try {
+    await bot.pathfinder.goto(new goals.GoalBlock(x, y, z))
+    console.log('✅ Đã tới nơi.')
   } catch (e) {
-    // bo qua loi anti-afk, khong quan trong
+    console.log('❌ Không tới được:', e.message)
   }
 }
 
-// ===== Gui trang thai bot dinh ky cho Colab (ngu canh cho AI) =====
+async function digNearest(blockName, count = 1) {
+  if (!bot) return console.log('⚠️ Bot chưa kết nối.')
+  let dug = 0
+  for (let i = 0; i < count; i++) {
+    const block = bot.findBlock({ matching: b => b && b.name === blockName, maxDistance: 32 })
+    if (!block) { console.log(`❌ Không còn "${blockName}" gần đây.`); break }
 
-function startStatusReporting() {
-  if (statusInterval) clearInterval(statusInterval)
-  statusInterval = setInterval(() => {
-    if (!bot || !bot.entity) return
-    const pos = bot.entity.position
-    const inventory = bot.inventory.items().map((i) => ({ name: i.name, count: i.count }))
-
-    broadcastToColab({
-      type: 'bot_status',
-      position: { x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z) },
-      health: bot.health,
-      food: bot.food,
-      inventory,
-      timestamp: Date.now(),
-    })
-  }, 10000)
+    try {
+      await bot.pathfinder.goto(new goals.GoalBreakBlock(block.position.x, block.position.y, block.position.z))
+      await bot.dig(block)
+      dug++
+      console.log(`⛏️ [${dug}/${count}] Đã đào "${blockName}"`)
+    } catch (e) {
+      console.log('❌ Lỗi đào:', e.message)
+      break
+    }
+  }
+  console.log(`✅ Hoàn tất: đào được ${dug}/${count} khối "${blockName}"`)
 }
 
-// ===== Ket noi vao server Minecraft =====
+async function followPlayer(username) {
+  if (!bot) return console.log('⚠️ Bot chưa kết nối.')
+  const target = bot.players[username]?.entity
+  if (!target) return console.log(`❌ Không thấy người chơi "${username}" gần đây.`)
+  bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true)
+  console.log(`🏃 Đang theo "${username}"`)
+}
 
+function stopFollow() {
+  if (!bot) return
+  try { bot.pathfinder.setGoal(null) } catch (e) {}
+  try { bot.clearControlStates() } catch (e) {}
+  console.log('🛑 Đã dừng theo/di chuyển')
+}
+
+async function attackNearest(mobName) {
+  if (!bot) return console.log('⚠️ Bot chưa kết nối.')
+  const entity = Object.values(bot.entities).find(e =>
+    e.name === mobName || (e.mobType && e.mobType.toLowerCase() === mobName.toLowerCase())
+  )
+  if (!entity) return console.log(`❌ Không thấy "${mobName}" gần đây.`)
+
+  try {
+    await bot.pathfinder.goto(new goals.GoalFollow(entity, 1))
+    bot.attack(entity)
+    console.log(`⚔️ Đã tấn công "${mobName}"`)
+  } catch (e) {
+    console.log('❌ Lỗi tấn công:', e.message)
+  }
+}
+
+async function collectNearbyItems() {
+  if (!bot) return console.log('⚠️ Bot chưa kết nối.')
+  const items = Object.values(bot.entities).filter(e => e.name === 'item')
+  if (items.length === 0) return console.log('ℹ️ Không có item nào gần đây.')
+
+  console.log(`📦 Tìm thấy ${items.length} item, đang nhặt...`)
+  for (const item of items) {
+    try {
+      await bot.pathfinder.goto(new goals.GoalBlock(
+        Math.floor(item.position.x), Math.floor(item.position.y), Math.floor(item.position.z)
+      ))
+    } catch (e) { /* bỏ qua nếu không tới được */ }
+  }
+  console.log('✅ Đã đi nhặt xong (nếu tới kịp trước khi item mất/bị nhặt).')
+}
+
+// ===== CONNECT =====
 function connect() {
+  destroyBot()
+  registered = false
+  loggedIn = false
+  connectedSince = null
+
+  if (reportInterval) clearInterval(reportInterval)
+  if (afkTimeout)     clearTimeout(afkTimeout)
+
   bot = mineflayer.createBot({
-    host: CONFIG.host,
-    port: CONFIG.port,
-    username: CONFIG.username,
-    version: CONFIG.version,
-    auth: CONFIG.auth,
-    checkTimeoutInterval: 60000, // tang thoi gian cho keepalive, tranh timeout gia do mang lag
-    viewDistance: 'tiny', // yeu cau server gui it chunk nhat co the (toi thieu giao thuc cho phep, khong the = 0)
+    host: HOST,
+    port: PORT,
+    username: USERNAME,
+    version: VERSION,
+    auth: 'offline',
+    viewDistance: 5,
+    checkTimeoutInterval: 30000,
+    closeTimeout: 30000,
   })
 
-  bot.loadPlugin(pathfinder)
-  bot.loadPlugin(collectBlockPlugin)
-  bot.loadPlugin(toolPlugin)
+  bot.loadPlugin(pathfinderPkg.pathfinder)
+
+  let endHandled = false
+  function handleDisconnect(reason) {
+    if (endHandled) return
+    endHandled = true
+    connectedSince = null
+    registered = false
+    loggedIn = false
+    if (afkTimeout)     clearTimeout(afkTimeout)
+    if (reportInterval) clearInterval(reportInterval)
+    if (!shuttingDown) scheduleReconnect()
+  }
 
   bot.once('spawn', () => {
-    console.log('✅ Bot đã vào server.')
-    reconnectAttempts = 0
-
-    const mcData = require('minecraft-data')(bot.version)
-    const movements = new Movements(bot, mcData)
-    bot.pathfinder.setMovements(movements)
-
-    scheduleAfk()
-    startStatusReporting()
+    try {
+      const movements = new Movements(bot)
+      bot.pathfinder.setMovements(movements)
+    } catch (e) {
+      console.log('⚠️ Không khởi tạo được pathfinder movements:', e.message)
+    }
   })
 
+  bot.on('spawn', () => {
+    connectedSince = Date.now()
+    reconnectAttempts = 0
+    console.log('✅ Bot đã vào server')
+    scheduleAfk()
+
+    reportInterval = setInterval(() => {
+      if (!bot) return
+      const pos = bot.entity ? bot.entity.position : null
+      const posStr = pos ? `${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}` : '?'
+      const chunkCount = Object.keys(bot.world.columns || {}).length
+      console.log(`📊 [${new Date().toLocaleTimeString()}] RAM: ${memUsageMB()}MB | Online: ${formatDuration(Date.now() - connectedSince)} | Chunk: ${chunkCount} | Pos: ${posStr}`)
+    }, 15000)
+  })
+
+  function handleMessage(text) {
+    if (!text) return
+
+    if (!registered && /register|đăng ký/i.test(text) && !/đã đăng ký/i.test(text)) {
+      registered = true
+      setTimeout(() => { try { bot.chat(`/register ${PASSWORD} ${PASSWORD}`) } catch(e){} }, 2500)
+    }
+    if (!loggedIn && /login|đăng nhập/i.test(text) && !/đã đăng nhập/i.test(text)) {
+      loggedIn = true
+      setTimeout(() => { try { bot.chat(`/login ${PASSWORD}`) } catch(e){} }, 2500)
+    }
+    if (/đăng nhập thành công/i.test(text)) { loggedIn = true; console.log('🔑 Đăng nhập thành công!') }
+    if (/đăng ký thành công/i.test(text))   { registered = true; console.log('📝 Đăng ký thành công!') }
+    if (/vui lòng.*discord|liên kết.*discord|link.*discord|discord.*để.*tiếp tục|bắt buộc.*discord/i.test(text)) {
+      goIdle('Server yêu cầu link Discord, không thể tiếp tục')
+    }
+  }
+
   bot.on('chat', (username, message) => {
-    if (username === bot.username) return
+    if (username === USERNAME) return
     console.log(`💬 <${username}> ${message}`)
+    handleMessage(message)
+  })
 
-    if (username !== CONFIG.owner) return
-
-    broadcastToColab({
-      type: 'game_chat',
-      source: 'game_chat',
-      username,
-      message,
-      timestamp: Date.now(),
-    })
+  bot.on('message', (jsonMsg) => {
+    const text = jsonMsg.toString()
+    console.log(`💬 ${text}`)
+    handleMessage(text)
   })
 
   bot.on('kicked', (reason) => {
-    console.log('👢 Bị kick khỏi server:', reason)
+    console.log('👢 Bị kick:', reason)
+    if (/banned|ban|đã bị cấm/i.test(reason))          console.log('🚫 Bot có thể bị BAN!')
+    if (/full|đầy server/i.test(reason))                console.log('🏠 Server đang đầy!')
+    if (/afk|di chuyển|không hoạt động/i.test(reason)) console.log('🚶 Bị kick do AFK!')
+    handleDisconnect('kicked')
   })
 
-  bot.on('error', (err) => {
-    console.log('❌ Lỗi bot:', err && err.message ? err.message : err)
-  })
-
-  bot.on('end', (reason) => {
-    console.log('🔌 Mất kết nối:', reason || '')
-    if (afkTimeout) clearTimeout(afkTimeout)
-    if (statusInterval) clearInterval(statusInterval)
-    clearFollowTasks()
-    bot = null
-    if (!shuttingDown) scheduleReconnect()
-  })
+  bot.on('end',   (reason) => { console.log('🔌 Mất kết nối:', reason || ''); handleDisconnect('end') })
+  bot.on('error', (err)    => { console.log('❌ Lỗi:', err?.message || err);  handleDisconnect('error') })
 }
 
-function scheduleReconnect() {
-  const delay = Math.min(5000 * Math.pow(1.5, reconnectAttempts), 120000)
-  reconnectAttempts++
-  console.log(`⏳ Kết nối lại sau ${Math.round(delay / 1000)}s (lần ${reconnectAttempts})...`)
-  setTimeout(connect, delay)
+// ===== Console điều khiển =====
+function showHelp() {
+  console.log('───── 🛠️ LỆNH ĐIỀU KHIỂN ─────')
+  console.log('help                 - danh sách lệnh')
+  console.log('status               - trạng thái bot')
+  console.log('say <tin nhắn>       - gửi chat')
+  console.log('reconnect            - kết nối lại ngay')
+  console.log('idle                 - cho bot nghỉ')
+  console.log('wake                 - bật lại bot')
+  console.log('jump                 - bot nhảy 1 lần')
+  console.log('stop                 - dừng mọi di chuyển của bot')
+  console.log('goto <x> <y> <z>     - di chuyển tới toạ độ')
+  console.log('dig <block> [số]     - tự tìm & đào block (vd: dig stone 10)')
+  console.log('follow <tên player>  - đi theo người chơi')
+  console.log('stopfollow           - dừng theo người chơi')
+  console.log('attack <tên mob>     - tấn công mob gần nhất')
+  console.log('collect              - tự nhặt item gần đây')
+  console.log('───────────────────────────────')
 }
 
-process.on('uncaughtException', (err) => console.log('🆘 uncaughtException:', err?.message || err))
-process.on('unhandledRejection', (reason) => console.log('🆘 unhandledRejection:', reason))
-process.on('SIGINT', () => {
-  shuttingDown = true
-  console.log('\n👋 Đang tắt bot...')
-  if (bot) bot.end()
-  if (tunnelProcess) tunnelProcess.kill()
-  if (wss) wss.close()
-  process.exit(0)
+function showStatus() {
+  console.log('───── 📋 TRẠNG THÁI BOT ─────')
+  console.log(`🕐 Script chạy: ${formatDuration(Date.now() - scriptStartTime)}`)
+  console.log(`💾 RAM: ${memUsageMB()} MB`)
+  console.log(`🔁 Tổng reconnect: ${totalReconnects}`)
+  if (shuttingDown) {
+    console.log('💤 Đang NGHỈ. Gõ "wake" để bật lại.')
+  } else if (bot && connectedSince) {
+    const pos = bot.entity ? bot.entity.position : null
+    console.log(`✅ Online: ${formatDuration(Date.now() - connectedSince)}`)
+    console.log(`📍 Vị trí: ${pos ? `${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}` : 'chưa rõ'}`)
+    console.log(`📝 Registered: ${registered} | 🔑 LoggedIn: ${loggedIn}`)
+  } else if (nextReconnectAt) {
+    const s = Math.max(0, Math.round((nextReconnectAt - Date.now()) / 1000))
+    console.log(`⏳ Chờ kết nối lại sau ${s}s (lần ${reconnectAttempts})`)
+  } else {
+    console.log('🔌 Đang kết nối...')
+  }
+  console.log('─────────────────────────────')
+}
+
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', (line) => {
+  const input = line.trim()
+  if (!input) return
+  const [cmd, ...rest] = input.split(' ')
+  const arg = rest.join(' ')
+
+  switch (cmd.toLowerCase()) {
+    case 'help':   showHelp();   break
+    case 'status': showStatus(); break
+    case 'say':
+    case 'chat':
+      if (!arg) console.log('⚠️ Cú pháp: say <tin nhắn>')
+      else if (shuttingDown || !bot) console.log('⚠️ Bot chưa kết nối hoặc đang nghỉ.')
+      else { try { bot.chat(arg); console.log(`📤 Đã gửi: ${arg}`) } catch (e) { console.log('❌', e.message) } }
+      break
+    case 'reconnect': forceReconnect(); break
+    case 'idle':
+    case 'pause':
+      if (shuttingDown) console.log('ℹ️ Bot đã ở chế độ nghỉ.')
+      else goIdle('Lệnh "idle" từ console')
+      break
+    case 'wake':
+    case 'resume': wake(); break
+    case 'jump':
+      if (!bot) { console.log('⚠️ Bot chưa kết nối.'); break }
+      bot.setControlState('jump', true)
+      setTimeout(() => { try { bot.setControlState('jump', false) } catch(e){} }, 400)
+      console.log('🦘 Đã nhảy')
+      break
+    case 'stop':
+      stopFollow()
+      break
+    case 'goto': {
+      const [x, y, z] = arg.split(' ').map(Number)
+      if ([x, y, z].some(isNaN)) { console.log('⚠️ Cú pháp: goto <x> <y> <z>'); break }
+      gotoCoords(x, y, z)
+      break
+    }
+    case 'dig': {
+      const parts = arg.split(' ')
+      const blockName = parts[0]
+      const count = parseInt(parts[1]) || 1
+      if (!blockName) { console.log('⚠️ Cú pháp: dig <tên block> [số lượng]'); break }
+      digNearest(blockName, count)
+      break
+    }
+    case 'follow':
+      if (!arg) { console.log('⚠️ Cú pháp: follow <tên người chơi>'); break }
+      followPlayer(arg)
+      break
+    case 'stopfollow':
+      stopFollow()
+      break
+    case 'attack':
+      if (!arg) { console.log('⚠️ Cú pháp: attack <tên mob>'); break }
+      attackNearest(arg)
+      break
+    case 'collect':
+      collectNearbyItems()
+      break
+    default: console.log(`❓ Không hiểu lệnh "${cmd}". Gõ "help".`)
+  }
 })
 
-console.log('🚀 Đang khởi động Minecraft AI Bot...')
-startWebSocketServer()
-startConsoleChat()
+process.on('uncaughtException',  (err)    => console.log('🆘 uncaughtException:', err?.message || err))
+process.on('unhandledRejection', (reason) => console.log('🆘 unhandledRejection:', reason))
+
+console.log('🚀 AFK Bot khởi động (Mineflayer)...')
+console.log('💡 Gõ "help" để xem lệnh.')
+acquireWakeLock()
+scheduleAutoShutdown(5)
 connect()
