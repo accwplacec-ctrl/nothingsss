@@ -1,0 +1,16 @@
+# ===== Cau hinh ket noi Minecraft =====
+MC_HOST=jjjggdffgg.aternos.me
+MC_PORT=34242
+MC_USERNAME=thaoyen
+MC_VERSION=false
+MC_AUTH=offline
+
+# ===== Nguoi choi duy nhat duoc phep ra lenh =====
+OWNER_NAME=tius
+
+# ===== WebSocket server (bot Node.js dong vai tro server) =====
+WS_PORT=8765
+
+# ===== Anti-AFK / hanh vi tu nhien =====
+AFK_MIN_INTERVAL_SEC=45
+AFK_MAX_INTERVAL_SEC=100
